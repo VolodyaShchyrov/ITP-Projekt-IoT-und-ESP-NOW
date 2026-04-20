@@ -36,7 +36,14 @@ Zusätzlich werden Ausgabekomponenten wie ein OLED-Display, eine RGB-LED sowie e
 
 ## 4. Arbeitsschritte
 
-////////////////
+Zunächst wurden die benötigten Komponenten ausgewählt und vorbereitet. Dazu gehörten zwei ESP32-Mikrocontroller, ein Ultraschallsensor, ein OLED-Display, eine RGB-LED sowie ein Buzzer.  
+
+Anschließend wurde der Ultraschallsensor mit dem ersten ESP32 verbunden, sodass Distanzmessungen durchgeführt werden konnten. Die gemessenen Werte wurden lokal auf dem OLED-Display angezeigt. Zusätzlich wurden visuelle Signale über eine RGB-LED sowie akustische Signale über einen Buzzer ausgegeben, um unterschiedliche Abstände darzustellen.  
+
+Im nächsten Schritt wurde die Kommunikation zwischen zwei ESP32-Geräten mithilfe von ESP-NOW eingerichtet. Der erste ESP32 fungiert dabei als Sender und überträgt die gemessenen Distanzwerte. Der zweite ESP32 empfängt diese Daten.  
+
+Abschließend wurde auf dem zweiten ESP32 ein Webinterface implementiert, über welches die empfangenen Daten im Browser angezeigt werden können.
+
 
 ---
 
@@ -44,8 +51,303 @@ Zusätzlich werden Ausgabekomponenten wie ein OLED-Display, eine RGB-LED sowie e
 
 Der verwendete Code umfasst die Initialisierung der Sensoren, die Berechnung der Distanz sowie die drahtlose Übertragung mittels ESP-NOW.  
 
-///////////////////////////////
+#### ESP32 Sender code
 
+```c++
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------- pins ----------
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+#define LED_R 25
+#define LED_G 26
+#define LED_B 27
+#define SDA_PIN 17
+#define SCL_PIN 16
+#define SOUND 33 
+
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ---------- ESP-NOW ----------
+typedef struct {
+  float distance;
+} DataPacket;
+
+DataPacket data;
+bool espNowConnected = false;
+
+// MAC resiever
+uint8_t receiverMAC[] = {0x00, 0x70, 0x07, 0x19, 0x89, 0x58};
+
+// ---------- CALLBACK ----------
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  espNowConnected = (status == ESP_NOW_SEND_SUCCESS);
+}
+
+// ---------- sensor ----------
+float readDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  float distance = duration * 0.034 / 2.0;
+
+  return (distance <= 0 || distance > 400) ? 0 : distance;
+}
+
+// ---------- RGB ----------
+void setColor(int r, int g, int b) {
+  analogWrite(LED_R, r);
+  analogWrite(LED_G, g);
+  analogWrite(LED_B, b);
+}
+
+void updateRGB(float d) {
+  if (d > 40)      setColor(0, 255, 0);
+  else if (d > 20) setColor(255, 120, 0);
+  else if (d > 0)  setColor(255, 0, 0);
+  else             setColor(0, 0, 50);
+}
+
+// ---------- sound ----------
+void updateSound(float d) {
+  digitalWrite(SOUND, (d < 20 && d > 0));
+}
+
+// ---------- OLED ----------
+void updateOLED(float d) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("ESP-NOW: ");
+  display.println(espNowConnected ? "OK" : "ERROR");
+
+  display.setTextSize(2);
+  display.setCursor(0, 18);
+  display.print("Distance:");
+
+  display.setTextSize(3);
+  display.setCursor(0, 40);
+  if (d > 0) {
+    display.print(d, 1);
+    display.print("cm");
+  } else {
+    display.print("----");
+  }
+
+  display.display();
+}
+
+// ---------- send ----------
+void sendData(float d) {
+  data.distance = d;
+  esp_now_send(receiverMAC, (uint8_t *)&data, sizeof(data));
+}
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  pinMode(SOUND, OUTPUT);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init error");
+    return;
+  }
+
+  esp_now_register_send_cb(onDataSent);
+
+  
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Peer add error");
+    return;
+  }
+
+  Serial.println("Transmitter ready");
+}
+
+
+void loop() {
+  float dist = readDistance();
+
+  Serial.printf("Distance: %.1f cm\n", dist);
+
+  updateRGB(dist);
+  updateSound(dist);
+  updateOLED(dist);
+  sendData(dist);
+
+  delay(500);
+}
+
+```
+#### ESP32 Empfänger
+
+```c++
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_now.h>
+
+const char* ssid = "vova_esp";
+const char* password = "123456qwerty";
+
+WebServer server(80);
+
+typedef struct {
+  float distance;
+} DataPacket;
+
+DataPacket receivedData;
+
+float lastMinute[12];
+int indexMinute = 0;
+
+bool espNowOnline = false;
+unsigned long lastPacketTime = 0;
+
+// ---------- HTML ----------
+String getHTML() {
+  return R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<h2>ESP Distanz</h2>
+<p>Status: <span id="status">OFFLINE</span></p>
+<p>Distanz: <span id="dist">0</span> cm</p>
+<canvas id="chart"></canvas>
+
+<script>
+let chart;
+
+function createChart(){
+ const ctx=document.getElementById('chart').getContext('2d');
+ chart=new Chart(ctx,{
+  type:'line',
+  data:{labels:[0,5,10,15,20,25,30,35,40,45,50,55],
+  datasets:[{data:Array(12).fill(0)}]}
+ });
+}
+
+async function load(){
+ try{
+  const r=await fetch('/data');
+  const j=await r.json();
+
+  chart.data.datasets[0].data=j.values;
+  chart.update();
+
+  document.getElementById('dist').innerText =
+    j.values[j.values.length-1];
+
+  document.getElementById('status').innerText =
+    j.online ? "ONLINE" : "OFFLINE";
+ }catch{}
+}
+
+createChart();
+setInterval(load,2000);
+</script>
+</body>
+</html>
+)rawliteral";
+}
+
+// ---------- JSON ----------
+void handleData() {
+  String json = "{\"values\":[";
+  for (int i = 0; i < 12; i++) {
+    json += String(lastMinute[i]);
+    if (i < 11) json += ",";
+  }
+  json += "],\"online\":";
+  json += espNowOnline ? "true" : "false";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// ---------- ESP-NOW ----------
+void onDataRecv(const esp_now_recv_info_t *info,
+                const uint8_t *incomingData,
+                int len) {
+
+  memcpy(&receivedData, incomingData, sizeof(receivedData));
+
+  lastMinute[indexMinute] = receivedData.distance;
+  indexMinute = (indexMinute + 1) % 12;
+
+  espNowOnline = true;
+  lastPacketTime = millis();
+
+  Serial.print("Received: ");
+  Serial.println(receivedData.distance);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(ssid, password, 1); 
+
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  for (int i = 0; i < 12; i++) lastMinute[i] = 0;
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW error");
+    return;
+  }
+
+  esp_now_register_recv_cb(onDataRecv);
+
+  server.on("/", [](){ server.send(200, "text/html", getHTML()); });
+  server.on("/data", handleData);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  // OFFLINE
+  if (millis() - lastPacketTime > 10000)
+    espNowOnline = false;
+}
+
+```
 ---
 
 ### Bilder und Schaltungen
