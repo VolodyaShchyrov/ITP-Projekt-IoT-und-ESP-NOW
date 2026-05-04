@@ -356,7 +356,7 @@ Die Schaltung besteht aus einem ESP32, der mit einem Ultraschallsensor, einem OL
 
 Eine zweite ESP32-Einheit dient als Empfänger der Daten und stellt diese über ein Webinterface dar.  
 
-/////////////////////////////////////////////
+![Schaltung](img/Screenshot%202026-05-04%20103905.png)
 
 ---
 
