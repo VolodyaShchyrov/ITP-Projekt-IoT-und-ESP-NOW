@@ -1,7 +1,7 @@
 # ITP Projekt IoT und ESP-NOW
 ## Abstandsmesssystem
 
-**Gruppenmitglieder:** Volodymyr Shchyrov, Peter Pavic-Nikolic  
+**Gruppenmitglieder:** Volodymyr Shchyrov, Petar Pavic-Nikolic  
 **Datum:** 20.04.2026  
 
 ---
