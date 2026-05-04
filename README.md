@@ -387,6 +387,9 @@ Das Projekt zeigt die Möglichkeiten moderner Mikrocontroller im Bereich IoT und
 
 ## 6. Quellen
 
-[1] Espressif Systems. *ESP-NOW User Guide*.  
-[2] Random Nerd Tutorials. *ESP32 ESP-NOW Tutorial*.  
-[3] Technische Dokumentation – Wikipedia.  
+
+[[1] ESP32 - OLED](https://esp32io.com/tutorials/esp32-oled)
+
+[[2] Random Nerd Tutorials. *ESP32 ESP-NOW Tutorial*.](https://randomnerdtutorials.com/esp-now-esp32-arduino-ide/) 
+
+[[3] „How To Create a Color Picker“](https://www.w3schools.com/howto/howto_html_colorpicker.asp)
