@@ -216,6 +216,7 @@ void loop() {
 #include <WebServer.h>
 #include <esp_now.h>
 
+// --- Configuration ---
 const char* ssid = "vova_esp";
 const char* password = "123456qwerty";
 
@@ -227,124 +228,196 @@ typedef struct {
 
 DataPacket receivedData;
 
-float lastMinute[12];
-int indexMinute = 0;
+// --- Global Variables ---
+float distanceHistory[12]; // Stores 12 readings (5 sec each = 1 min total)
+int historyIndex = 0;
+unsigned long lastHistoryUpdate = 0;
+float latestDistance = 0;
 
-bool espNowOnline = false;
-unsigned long lastPacketTime = 0;
+bool isEspNowOnline = false;
+unsigned long lastIncomingPacketTime = 0;
 
-// ---------- HTML ----------
+// ---------- HTML UI (English) ----------
 String getHTML() {
   return R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ESP32 Distance Monitor</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; background: #eceff1; color: #333; }
+        .card { max-width: 700px; margin: 40px auto; background: white; padding: 30px; border-radius: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        .status-box { padding: 5px 10px; border-radius: 5px; font-weight: bold; }
+        .online { background: #e8f5e9; color: #2e7d32; }
+        .offline { background: #ffebee; color: #c62828; }
+        .value-display { font-size: 2em; color: #0288d1; margin: 10px 0; }
+    </style>
 </head>
 <body>
-<h2>ESP Distanz</h2>
-<p>Status: <span id="status">OFFLINE</span></p>
-<p>Distanz: <span id="dist">0</span> cm</p>
-<canvas id="chart"></canvas>
+    <div class="card">
+        <h2>Ultrasonic Sensor Monitor</h2>
+        <div id="statusIndicator" class="status-box offline">STATUS: OFFLINE</div>
+        <div class="value-display"><span id="dist">0.0</span> cm</div>
+        <canvas id="distanceChart"></canvas>
+    </div>
 
 <script>
 let chart;
+const timeLabels = ['55s','50s','45s','40s','35s','30s','25s','20s','15s','10s','5s','Now'];
 
-function createChart(){
- const ctx=document.getElementById('chart').getContext('2d');
- chart=new Chart(ctx,{
-  type:'line',
-  data:{labels:[0,5,10,15,20,25,30,35,40,45,50,55],
-  datasets:[{data:Array(12).fill(0)}]}
- });
+function initChart(){
+    const ctx = document.getElementById('distanceChart').getContext('2d');
+    chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: timeLabels,
+            datasets: [{
+                label: 'Distance (cm)',
+                data: Array(12).fill(0),
+                borderColor: '#0288d1',
+                backgroundColor: 'rgba(2, 136, 209, 0.1)',
+                fill: true,
+                tension: 0.4
+            }]
+        },
+        options: {
+            scales: { y: { beginAtZero: true } },
+            animation: { duration: 800 }
+        }
+    });
 }
 
-async function load(){
- try{
-  const r=await fetch('/data');
-  const j=await r.json();
+async function fetchData(){
+    try {
+        const response = await fetch('/data');
+        const data = await response.json();
+        
+        // Update Chart
+        chart.data.datasets[0].data = data.values;
+        chart.update();
 
-  chart.data.datasets[0].data=j.values;
-  chart.update();
-
-  document.getElementById('dist').innerText =
-    j.values[j.values.length-1];
-
-  document.getElementById('status').innerText =
-    j.online ? "ONLINE" : "OFFLINE";
- }catch{}
+        // Update Text & Status
+        const currentVal = data.values[data.values.length - 1];
+        document.getElementById('dist').innerText = currentVal.toFixed(1);
+        
+        const statusDiv = document.getElementById('statusIndicator');
+        if(data.online) {
+            statusDiv.innerText = "STATUS: ONLINE";
+            statusDiv.className = "status-box online";
+        } else {
+            statusDiv.innerText = "STATUS: OFFLINE";
+            statusDiv.className = "status-box offline";
+        }
+    } catch(err) { console.error("Fetch error:", err); }
 }
 
-createChart();
-setInterval(load,2000);
+initChart();
+setInterval(fetchData, 5000); // Request data every 5 seconds
+fetchData(); 
 </script>
 </body>
 </html>
 )rawliteral";
 }
 
-// ---------- JSON ----------
-void handleData() {
+// ---------- JSON Endpoint ----------
+void handleDataRequest() {
   String json = "{\"values\":[";
+  // Reorder history so the newest data is at the end of the array
   for (int i = 0; i < 12; i++) {
-    json += String(lastMinute[i]);
+    int idx = (historyIndex + i) % 12;
+    json += String(distanceHistory[idx]);
     if (i < 11) json += ",";
   }
   json += "],\"online\":";
-  json += espNowOnline ? "true" : "false";
+  json += isEspNowOnline ? "true" : "false";
   json += "}";
 
   server.send(200, "application/json", json);
 }
 
-// ---------- ESP-NOW ----------
-void onDataRecv(const esp_now_recv_info_t *info,
-                const uint8_t *incomingData,
-                int len) {
-
+// ---------- ESP-NOW Callback ----------
+void onDataReceive(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
   memcpy(&receivedData, incomingData, sizeof(receivedData));
-
-  lastMinute[indexMinute] = receivedData.distance;
-  indexMinute = (indexMinute + 1) % 12;
-
-  espNowOnline = true;
-  lastPacketTime = millis();
-
-  Serial.print("Received: ");
-  Serial.println(receivedData.distance);
+  
+  latestDistance = receivedData.distance;
+  isEspNowOnline = true;
+  lastIncomingPacketTime = millis();
+  
+  // Print incoming data details to Serial
+  Serial.print("[ESP-NOW] New Data from: ");
+  for (int i = 0; i < 6; i++) {
+    Serial.printf("%02X%s", info->src_addr[i], (i < 5) ? ":" : "");
+  }
+  Serial.printf(" | Distance: %.2f cm\n", latestDistance);
 }
 
 void setup() {
   Serial.begin(115200);
+  delay(1000);
 
-  
+  Serial.println("\n--- ESP32 Setup Started ---");
+
+  // Initialize WiFi in Access Point + Station mode
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(ssid, password, 1); 
 
-  Serial.print("IP: ");
+  // Print AP Information
+  Serial.print("[WiFi] Access Point Created. SSID: ");
+  Serial.println(ssid);
+  Serial.print("[WiFi] IP Address: ");
   Serial.println(WiFi.softAPIP());
 
-  for (int i = 0; i < 12; i++) lastMinute[i] = 0;
-
+  // Initialize ESP-NOW
   if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW error");
+    Serial.println("[Error] ESP-NOW Initialization Failed");
     return;
   }
+  Serial.println("[ESP-NOW] Initialized Successfully");
 
-  esp_now_register_recv_cb(onDataRecv);
+  // Register Receive Callback
+  esp_now_register_recv_cb(onDataReceive);
 
+  // Configure Web Server Routes
   server.on("/", [](){ server.send(200, "text/html", getHTML()); });
-  server.on("/data", handleData);
+  server.on("/data", handleDataRequest);
   server.begin();
+  
+  Serial.println("[Server] HTTP Server Started");
+
+  // Clear history buffer
+  for (int i = 0; i < 12; i++) distanceHistory[i] = 0;
+  
+  Serial.println("--- Setup Complete ---\n");
 }
 
 void loop() {
   server.handleClient();
 
-  // OFFLINE
-  if (millis() - lastPacketTime > 10000)
-    espNowOnline = false;
+  // Update history buffer every 5 seconds
+  if (millis() - lastHistoryUpdate >= 5000) {
+    lastHistoryUpdate = millis();
+    distanceHistory[historyIndex] = latestDistance;
+    historyIndex = (historyIndex + 1) % 12;
+
+    // Print periodic status report to Serial
+    Serial.print("[System Report] Status: ");
+    Serial.print(isEspNowOnline ? "ONLINE" : "OFFLINE");
+    Serial.print(" | Last Recorded Value: ");
+    Serial.print(latestDistance);
+    Serial.println(" cm");
+  }
+
+  // Check if peer is offline (no data for 10 seconds)
+  if (millis() - lastIncomingPacketTime > 10000) {
+    if (isEspNowOnline) {
+      isEspNowOnline = false;
+      Serial.println("[Warning] Connection Lost (Timeout)");
+    }
+  }
 }
 
 ```
