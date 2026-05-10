@@ -60,39 +60,45 @@ Der verwendete Code umfasst die Initialisierung der Sensoren, die Berechnung der
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// ---------- pins ----------
+// ---------- Pin Definitions ----------
 #define TRIG_PIN 5
 #define ECHO_PIN 18
 #define LED_R 25
 #define LED_G 26
 #define LED_B 27
-#define SDA_PIN 17
-#define SCL_PIN 16
-#define SOUND 33 
+#define BUZZER_PIN 33 
 
-// ---------- OLED ----------
+// Standard I2C pins for ESP32
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// ---------- I2C Device Addresses ----------
+#define OLED_ADDR 0x3C
+#define LED_BAR_ADDR 32 // Decimal 32 (0x20) - for the 8-LED Bar
+
+// ---------- OLED Display Settings ----------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// ---------- ESP-NOW ----------
+// ---------- ESP-NOW Data Structure ----------
 typedef struct {
   float distance;
 } DataPacket;
 
-DataPacket data;
-bool espNowConnected = false;
+DataPacket sensorData;
+bool isConnected = false;
 
-// MAC resiever
-uint8_t receiverMAC[] = {0x00, 0x70, 0x07, 0x19, 0x89, 0x58};
+// Destination MAC Address (Update this to your actual receiver's MAC!)
+uint8_t receiverAddress[] = {0x00, 0x70, 0x07, 0x19, 0x89, 0x58};
 
-// ---------- CALLBACK ----------
+// ---------- ESP-NOW Send Callback (Updated for Core 3.x) ----------
 void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
-  espNowConnected = (status == ESP_NOW_SEND_SUCCESS);
+  isConnected = (status == ESP_NOW_SEND_SUCCESS);
 }
 
-// ---------- sensor ----------
-float readDistance() {
+// ---------- Sensor Logic ----------
+float getDistance() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
@@ -102,44 +108,64 @@ float readDistance() {
   long duration = pulseIn(ECHO_PIN, HIGH, 30000);
   float distance = duration * 0.034 / 2.0;
 
-  return (distance <= 0 || distance > 400) ? 0 : distance;
+  if (distance <= 0 || distance > 400) return 0;
+  return distance;
 }
 
-// ---------- RGB ----------
-void setColor(int r, int g, int b) {
+// ---------- RGB LED Logic ----------
+void setRGBColor(int r, int g, int b) {
   analogWrite(LED_R, r);
   analogWrite(LED_G, g);
   analogWrite(LED_B, b);
 }
 
-void updateRGB(float d) {
-  if (d > 40)      setColor(0, 255, 0);
-  else if (d > 20) setColor(255, 120, 0);
-  else if (d > 0)  setColor(255, 0, 0);
-  else             setColor(0, 0, 50);
+void manageRGB(float d) {
+  if (d == 0 || d > 40) setRGBColor(0, 255, 0);   // Green
+  else if (d > 20)      setRGBColor(255, 100, 0); // Orange
+  else                  setRGBColor(255, 0, 0);   // Red
 }
 
-// ---------- sound ----------
-void updateSound(float d) {
-  digitalWrite(SOUND, (d < 20 && d > 0));
+// ---------- 8-LED Bar Logic (I2C) ----------
+void manageLedBar(float d) {
+  byte dataToSend = 0x00;
+
+  if (d > 0 && d <= 40) {
+    // Map: 40cm (0 leds) -> 4cm (8 leds)
+    int numLeds = map((int)d, 4, 40, 8, 0);
+    numLeds = constrain(numLeds, 0, 8);
+
+    // Fill the bits (shifter)
+    for (int i = 0; i < numLeds; i++) {
+      dataToSend |= (1 << i);
+    }
+  }
+
+  Wire.beginTransmission(LED_BAR_ADDR);
+  Wire.write(dataToSend);
+  Wire.endTransmission();
 }
 
-// ---------- OLED ----------
-void updateOLED(float d) {
+// ---------- OLED Update Logic ----------
+void updateDisplay(float d) {
   display.clearDisplay();
+  
+  // Set Text properties
   display.setTextColor(SSD1306_WHITE);
-
+  
+  // Line 1: Status
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print("ESP-NOW: ");
-  display.println(espNowConnected ? "OK" : "ERROR");
+  display.println(isConnected ? "CONNECTED" : "DISCONNECT");
 
+  // Line 2: Label
   display.setTextSize(2);
-  display.setCursor(0, 18);
+  display.setCursor(0, 20);
   display.print("Distance:");
 
+  // Line 3: Value
   display.setTextSize(3);
-  display.setCursor(0, 40);
+  display.setCursor(0, 42);
   if (d > 0) {
     display.print(d, 1);
     display.print("cm");
@@ -147,65 +173,85 @@ void updateOLED(float d) {
     display.print("----");
   }
 
+  // Push to screen buffer
   display.display();
-}
-
-// ---------- send ----------
-void sendData(float d) {
-  data.distance = d;
-  esp_now_send(receiverMAC, (uint8_t *)&data, sizeof(data));
 }
 
 // ---------- SETUP ----------
 void setup() {
   Serial.begin(115200);
+  delay(1000); // Small wait for Serial
+  
+  Serial.println("--- Starting Transmitter ---");
 
+  // Pins Setup
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
   pinMode(LED_B, OUTPUT);
-  pinMode(SOUND, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
 
-  Wire.begin(SDA_PIN, SCL_PIN);
+  // Initialize I2C with GPIO 21, 22
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000); // Standard fast mode
 
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  // Initialize SSD1306 OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED error: Check address 0x3C or wiring!");
+  } else {
+    Serial.println("OLED initialized!");
+    display.clearDisplay();
+    display.display();
+  }
 
+  // WiFi & ESP-NOW Setup
   WiFi.mode(WIFI_STA);
-
   if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init error");
+    Serial.println("ESP-NOW Error");
     return;
   }
 
+  // Register the Callback
   esp_now_register_send_cb(onDataSent);
 
-  
+  // Add Receiver (Peer)
   esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, receiverMAC, 6);
+  memcpy(peerInfo.peer_addr, receiverAddress, 6);
   peerInfo.channel = 0;
   peerInfo.encrypt = false;
 
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("Peer add error");
+    Serial.println("Failed to add peer");
     return;
   }
 
-  Serial.println("Transmitter ready");
+  Serial.println("Setup Complete!");
 }
 
-
+// ---------- LOOP ----------
 void loop() {
-  float dist = readDistance();
+  float currentDistance = getDistance();
 
-  Serial.printf("Distance: %.1f cm\n", dist);
+  // Serial Monitor Output
+  Serial.print("Distance: ");
+  Serial.print(currentDistance);
+  Serial.print(" cm | Status: ");
+  Serial.println(isConnected ? "Online" : "Offline");
 
-  updateRGB(dist);
-  updateSound(dist);
-  updateOLED(dist);
-  sendData(dist);
+  // Update All Modules
+  manageRGB(currentDistance);
+  manageLedBar(currentDistance);
+  updateDisplay(currentDistance);
+  
+  // Buzzer Control (Beep if closer than 15cm)
+  digitalWrite(BUZZER_PIN, (currentDistance < 15 && currentDistance > 0));
 
-  delay(500);
+  // Send Data to Gateway
+  sensorData.distance = currentDistance;
+  esp_now_send(receiverAddress, (uint8_t *)&sensorData, sizeof(sensorData));
+
+  delay(200); // Frequency of updates
 }
 
 ```
